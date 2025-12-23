@@ -4,8 +4,45 @@
 #include <libportal/portal.h>
 #include <stdio.h>
 
+#define CAPTURE_WIDTH 256
+#define CAPTURE_HEIGHT 144
+#define CAPTURE_DEPTH 2
+#define CAPTURE_FPS 24
+
+typedef struct {
+        unsigned char r, g, b;
+} RGB;
+
+static RGB
+    g_final_buffer[(2 * (CAPTURE_WIDTH / CAPTURE_DEPTH + CAPTURE_HEIGHT / CAPTURE_DEPTH)) * 3];
+
 static XdpSession *g_session;
 static GstElement *g_pipeline;
+
+static void average_pixel_box(unsigned char *data, int start_x, int start_y, int box_size,
+                              RGB *result) {
+        int total_r = 0, total_g = 0, total_b = 0;
+        int count = 0;
+
+        for (int dy = 0; dy < box_size; dy++) {
+                for (int dx = 0; dx < box_size; dx++) {
+                        int x = start_x + dx;
+                        int y = start_y + dy;
+
+                        if (x >= 0 && x < CAPTURE_WIDTH && y >= 0 && y < CAPTURE_HEIGHT) {
+                                int offset = (y * CAPTURE_WIDTH + x) * 3;
+                                total_r += data[offset + 0];
+                                total_g += data[offset + 1];
+                                total_b += data[offset + 2];
+                                count++;
+                        }
+                }
+        }
+
+        result->r = count > 0 ? total_r / count : 0;
+        result->g = count > 0 ? total_g / count : 0;
+        result->b = count > 0 ? total_b / count : 0;
+}
 
 static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
         GstSample *sample;
@@ -19,26 +56,46 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
 
         buffer = gst_sample_get_buffer(sample);
         if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                memset(g_final_buffer, '0', sizeof(g_final_buffer));
 
-                printf("\033[2J\033[H");
+                int buffer_index = 0;
 
-                // Print frame header
-                printf("Frame: %zu bytes (256x144 RGB)\n", map.size);
-                printf("====================================\n");
-
-                // Print all pixels
-                for (int y = 0; y < 144; y++) {
-                        for (int x = 0; x < 256; x++) {
-                                int offset = (y * 256 + x) * 3;
-                                unsigned char r = map.data[offset + 0];
-                                unsigned char g = map.data[offset + 1];
-                                unsigned char b = map.data[offset + 2];
-
-                                // Print RGB values with ANSI color background
-                                printf("\033[48;2;%d;%d;%dm  \033[0m", r, g, b);
-                        }
-                        printf("\n");
+                // 1. BOTTOM EDGE: Right to left (bottom-right to bottom-left)
+                for (int x = CAPTURE_WIDTH - CAPTURE_DEPTH; x >= 0; x -= CAPTURE_DEPTH) {
+                        int y = CAPTURE_HEIGHT - CAPTURE_DEPTH;
+                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
+                                          &g_final_buffer[buffer_index++]);
                 }
+
+                // 2. LEFT EDGE: Bottom to top (bottom-left to top-left)
+                for (int y = CAPTURE_HEIGHT - CAPTURE_DEPTH; y >= 0; y -= CAPTURE_DEPTH) {
+                        int x = 0;
+                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
+                                          &g_final_buffer[buffer_index++]);
+                }
+
+                // 3. TOP EDGE: Left to right (top-left to top-right)
+                for (int x = 0; x < CAPTURE_WIDTH; x += CAPTURE_DEPTH) {
+                        int y = 0;
+                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
+                                          &g_final_buffer[buffer_index++]);
+                }
+
+                // 4. RIGHT EDGE: Top to bottom (top-right to bottom-right)
+                for (int y = 0; y < CAPTURE_HEIGHT; y += CAPTURE_DEPTH) {
+                        int x = CAPTURE_WIDTH - CAPTURE_DEPTH;
+                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
+                                          &g_final_buffer[buffer_index++]);
+                }
+
+                // printf("\033[2J\033[H");
+                // printf("Border samples (clockwise from bottom-right): %d\n", buffer_index);
+                // for (int i = 0; i < buffer_index; i++) {
+                //         printf("Sample %3d: RGB(%3d, %3d, %3d) ", i, g_final_buffer[i].r,
+                //                g_final_buffer[i].g, g_final_buffer[i].b);
+                //         printf("\033[48;2;%d;%d;%dm    \033[0m\n", g_final_buffer[i].r,
+                //                g_final_buffer[i].g, g_final_buffer[i].b);
+                // }
 
                 gst_buffer_unmap(buffer, &map);
         }
@@ -107,8 +164,8 @@ static void start_gstreamer(int fd, int node) {
         }
 
         caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGB", "width",
-                                   G_TYPE_INT, 256, "height", G_TYPE_INT, 144, "framerate",
-                                   GST_TYPE_FRACTION, 1, 1, NULL);
+                                   G_TYPE_INT, CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT,
+                                   "framerate", GST_TYPE_FRACTION, CAPTURE_FPS, 1, NULL);
 
         if (!gst_element_link_filtered(videorate, appsink, caps)) {
                 g_printerr("Failed to link with caps filter\n");
